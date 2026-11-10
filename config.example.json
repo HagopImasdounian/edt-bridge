@@ -1,0 +1,54 @@
+{
+  "inbox": "/srv/edt/inbox",
+  "data_dir": "/srv/edt/data",
+  "timezone": "America/Toronto",
+  "currency": "CAD",
+  "retention_days": 30,
+  "sales_lookback_days": 30,
+  "settle_seconds": 30,
+  "poll_seconds": 60,
+  "exclude_item_prefixes": [],
+  "sku_fields": [
+    "ItemMetaBaseSKU",
+    "ItemVendStyleCode",
+    "ItemStyle"
+  ],
+  "heartbeat_url": "",
+  "phone_country_code": "1",
+  "gold_rules": [],
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "password_env": "EDT_UI_PASSWORD",
+    "cloudflare_access": {
+      "team_domain": "yourteam.cloudflareaccess.com",
+      "aud": ""
+    }
+  },
+  "api": {
+    "port": 8788,
+    "default_layer": "silver",
+    "requests_per_minute": 120,
+    "max_limit": 500,
+    "cloudflare_access": {
+      "team_domain": "yourteam.cloudflareaccess.com",
+      "aud": ""
+    }
+  },
+  "destinations": [
+    {
+      "name": "my-webhook",
+      "type": "webhook",
+      "url": "https://example.com/edt",
+      "token_env": "EDT_WEBHOOK_TOKEN",
+      "events": [
+        "sale",
+        "stock",
+        "item",
+        "customer"
+      ],
+      "batch_size": 100,
+      "include_raw": false
+    }
+  ]
+}

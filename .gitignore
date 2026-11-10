@@ -1,0 +1,27 @@
+# Your store's environment never goes in git: config, secrets, the database, Edge files, logs.
+config.json
+config.*.json
+!config.example.json
+.env
+.env.*
+*.env
+customers/
+stores/
+data/
+inbox/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.log
+*.log.*
+lock
+*ItemList.json
+*CustomerList.json
+*.pem
+*.key
+
+__pycache__/
+*.pyc
+.DS_Store
+private/
