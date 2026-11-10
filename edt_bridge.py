@@ -711,6 +711,14 @@ def process_inbox(db, cfg, dry_run=False):
             for old in glob.glob(os.path.join(folder, "*.json")):
                 if os.path.getmtime(old) < cutoff:
                     os.remove(old)
+    if not dry_run:
+        # Edge can send other files too (item photos). Nothing here reads them, so they
+        # go once they are older than the retention period (a day at the least).
+        cutoff = time.time() - max(cfg["retention_days"], 1) * 86400
+        for other in glob.glob(os.path.join(inbox, "*")):
+            if os.path.isfile(other) and not other.endswith(("ItemList.json", "CustomerList.json")) \
+                    and os.path.getmtime(other) < cutoff:
+                os.remove(other)
 
 
 # --------------------------------------------------------------------------

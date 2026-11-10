@@ -1675,6 +1675,18 @@ class TestRebindingAndPlugins(unittest.TestCase):
         with self.assertRaises(PermissionError):
             eb.load_plugin({"module": loose})
 
+    def test_stray_inbox_files_are_removed_after_retention(self):
+        with tempfile.TemporaryDirectory() as root:
+            env = Env(root)
+            old, new = os.path.join(env.inbox, "110-00022.jpg"), os.path.join(env.inbox, "110-00066.jpg")
+            for path in (old, new):
+                open(path, "w").close()
+            long_ago = time.time() - 40 * 86400
+            os.utime(old, (long_ago, long_ago))
+            self.assertTrue(eb.run_once(env.cfg))
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(new))
+
     def test_post_does_not_follow_redirects(self):
         class Redirect(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
