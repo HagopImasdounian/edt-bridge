@@ -1,0 +1,46 @@
+# Edge Bridge: the read-only data API on 127.0.0.1:8788. Put Cloudflare Tunnel and Access in front.
+# Install as /etc/systemd/system/edt-bridge-api.service (needs systemd 245 or newer).
+[Unit]
+Description=Edge Bridge: data API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=edt
+Group=edt
+Environment=EDT_BRIDGE_CONFIG=/srv/edt/config/config.json
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/edt-bridge/edt_bridge.py api
+# Fails at start when api.cloudflare_access is not set or Cloudflare's keys cannot be fetched.
+Restart=on-failure
+RestartSec=10
+
+# Hardening. Each line limits what a bug or a stolen process could do.
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The API writes only its audit log and keeps the database open read-only. Config stays read-only.
+ReadWritePaths=/srv/edt/data
+
+[Install]
+WantedBy=multi-user.target

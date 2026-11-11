@@ -1,0 +1,18 @@
+# Edge Bridge: Cloudflare Tunnel config. Install as /etc/cloudflared/config.yml.
+# Create the tunnel first:  cloudflared tunnel create edt-bridge
+# Replace both TUNNEL-UUID values with the id that command prints.
+tunnel: TUNNEL-UUID
+credentials-file: /etc/cloudflared/TUNNEL-UUID.json
+
+# Do not set httpHostHeader. The interface compares the page's Origin with the Host
+# header, so the Host must stay the public name.
+ingress:
+  # The API: only paths under /v1 reach the bridge.
+  - hostname: edt-api.example.com
+    path: ^/v1(/|$)
+    service: http://127.0.0.1:8788
+  # The web interface, for people.
+  - hostname: edt.example.com
+    service: http://127.0.0.1:8787
+  # Everything else gets a 404 from the tunnel.
+  - service: http_status:404

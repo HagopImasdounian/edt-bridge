@@ -1,0 +1,48 @@
+# Edge Bridge: the web interface on 127.0.0.1:8787. Put Cloudflare Tunnel and Access in front.
+# Install as /etc/systemd/system/edt-bridge-ui.service (needs systemd 245 or newer).
+[Unit]
+Description=Edge Bridge: web interface
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=edt
+Group=edt
+Environment=EDT_BRIDGE_CONFIG=/srv/edt/config/config.json
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# Holds EDT_UI_PASSWORD if you set ui.password_env. Root:root, mode 0600.
+EnvironmentFile=-/etc/edt-bridge/env
+ExecStart=/usr/bin/python3 /opt/edt-bridge/edt_bridge.py serve
+# Fails at start when it cannot fetch Cloudflare's signing keys. Retry until the network is up.
+Restart=on-failure
+RestartSec=10
+
+# Hardening. Each line limits what a bug or a stolen process could do.
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The Settings page saves config.json, so this service also needs the config folder.
+ReadWritePaths=/srv/edt/data /srv/edt/config
+
+[Install]
+WantedBy=multi-user.target

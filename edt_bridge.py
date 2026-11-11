@@ -2387,8 +2387,8 @@ def sku_rows(db, skus, store=None, rules=None):
         kept.add(r["sku"])
         o = out[r["sku"]]
         for field in ("name", "vendor", "category"):
-            if not o[field] and r[field]:
-                o[field] = r[field]
+            if not o[field] and clean_text(r[field]):
+                o[field] = clean_text(r[field])
         if not o["updated_at"] or r["updated_at"] > o["updated_at"]:
             o["updated_at"] = r["updated_at"]
         if r["state"] == "available":
@@ -2428,7 +2428,10 @@ def sale_out(row, scopes, cfg=None, layer="silver", db=None):
 
 def api_query(db, cfg, scopes, parts, query, max_limit, default_layer="silver"):
     """Answer one request. Returns (status, body). Raises BadRequest on bad input."""
-    asked = dict(parse_qsl(query, keep_blank_values=True, max_num_fields=50)) if query else {}
+    try:
+        asked = dict(parse_qsl(query, keep_blank_values=True, max_num_fields=50)) if query else {}
+    except ValueError:
+        raise BadRequest("too many parameters")
     layer = asked.get("layer") or (default_layer if default_layer in LAYERS else "silver")
     if layer not in LAYERS:
         raise BadRequest("layer must be one of: " + ", ".join(LAYERS))
@@ -2532,10 +2535,11 @@ def layer_query(db, cfg, scopes, parts, query, max_limit, layer):
             where, args = ["1=1"], []
             if state != "all":
                 where.append("state = ?"); args.append(state)
-            for name, col in (("sku", "sku"), ("serial", "serial_number"), ("item_key", "item_key"),
-                              ("store", "store_id")):
+            for name, col in (("sku", "sku"), ("item_key", "item_key"), ("store", "store_id")):
                 if q.get(name):
                     where.append(f"{col} = ?"); args.append(q[name])
+            if q.get("serial"):  # compared the way silver shows it: trimmed, upper case
+                where.append("upper(trim(serial_number)) = ?"); args.append(q["serial"].strip().upper())
             if q.get("q"):
                 where.append("(sku LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' OR vendor LIKE ? "
                              "ESCAPE '\\' OR serial_number LIKE ? ESCAPE '\\')")
@@ -2783,8 +2787,11 @@ def cmd_api(cfg, local=False, config_path=None):
                 parts = [unquote(p) for p in url.path.split("/") if p]
                 if not parts or parts[0] != "v1" or any(len(p) > 120 or "\x00" in p for p in parts):
                     return 404, {"error": "not found"}, None
-                note["params"] = sorted({k for k, _ in parse_qsl(url.query, keep_blank_values=True,
-                                                                 max_num_fields=50)})[:20]
+                try:
+                    note["params"] = sorted({k for k, _ in parse_qsl(url.query, keep_blank_values=True,
+                                                                     max_num_fields=50)})[:20]
+                except ValueError:
+                    raise BadRequest("too many parameters")
                 scopes = set(row["scopes"].split(",")) & set(API_SCOPES)
                 status, body = api_query(db, now_cfg, scopes, parts[1:] or ["index"], url.query, max_limit,
                                          str(now_api.get("default_layer") or "silver"))

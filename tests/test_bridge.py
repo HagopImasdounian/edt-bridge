@@ -1687,6 +1687,12 @@ class TestRebindingAndPlugins(unittest.TestCase):
             self.assertFalse(os.path.exists(old))
             self.assertTrue(os.path.exists(new))
 
+    def test_too_many_parameters_is_a_400(self):
+        key = self.env.key("inventory") if hasattr(self.env, "key") else None
+        query = "&".join(f"p{i}=1" for i in range(60))
+        with self.assertRaises(eb.BadRequest):
+            eb.api_query(None, self.env.cfg, {"inventory"}, ["inventory"], query, 500)
+
     def test_post_does_not_follow_redirects(self):
         class Redirect(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
