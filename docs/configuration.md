@@ -23,6 +23,7 @@ Settings are merged one level deep. A top-level key in your file replaces the de
 | `exclude_item_prefixes` | list of strings | `[]` | Pieces whose item key starts with one of these are marked `excluded`, not `available`. |
 | `sku_fields` | list of strings | `["ItemMetaBaseSKU", "ItemVendStyleCode", "ItemStyle"]` | Edge fields that make the SKU, in order. The first one filled in wins. Change it and the bridge regroups every piece on the next pass. Run `fields` to choose. |
 | `heartbeat_url` | string | `""` | A URL the bridge requests with GET after a pass in which every delivery succeeded. Point a monitoring service at it to learn when the bridge stops. |
+| `db_key_env` | string | `""` | Turns on database encryption. Names the environment variable that holds the key. See [encrypting the database](#encrypting-the-database). |
 | `phone_country_code` | string | `"1"` | Used by silver to write phone numbers as `+14165550100`. `"1"` applies North American rules. Another code, like `"44"`, is added in front of numbers that have none. |
 | `gold_rules` | list | `[]` | Your own corrections for the gold API layer. See [gold rules](#gold-rules). |
 | `ui` | object | see below | The web interface. |
@@ -73,7 +74,7 @@ The Settings page in the web interface edits a small set of keys and saves them 
 | `api.max_limit` | Yes | 1 to 900 |
 | `gold_rules` | Yes | Up to 200 valid rules |
 | `inbox`, `data_dir` | Server only | |
-| `settle_seconds`, `poll_seconds`, `heartbeat_url` | Server only | |
+| `settle_seconds`, `poll_seconds`, `heartbeat_url`, `db_key_env` | Server only | |
 | `destinations` and all their secrets | Server only | |
 | `ui.*` including the password and Access settings | Server only | |
 | `api.port`, `api.cloudflare_access.*` | Server only | |
@@ -310,3 +311,23 @@ Example:
 ```
 
 With these rules, `layer=gold` returns `Omega` for pieces Edge calls `Omgea`. It leaves out repair jobs and customers with a staff address. Silver and bronze still show everything.
+
+## Encrypting the database
+
+Off by default. Turn it on and the whole database file is encrypted with AES-256 (SQLCipher). Nothing else changes: the interface, the API, the views and the commands work the same.
+
+1. Install the one optional package for the user that runs the bridge: `pip install sqlcipher3-binary`.
+2. Make a key: `python3 -c "import secrets; print(secrets.token_hex(32))"`.
+3. Put it in the service's environment file, readable by root only: `EDT_DB_KEY=<the 64 characters>`.
+4. Set `"db_key_env": "EDT_DB_KEY"` in the config.
+5. If a database already exists, stop the services and run `edt_bridge.py encrypt` once. A new install needs nothing more.
+6. Start the services.
+
+What to know:
+
+- The key is never read from the config file, so it never sits next to the database.
+- With `db_key_env` set, the bridge refuses to start if the key or the package is missing. It never falls back to an unencrypted database.
+- Lose the key and the data cannot be read. Keep a copy in your password manager. Edge can send a full file again, but API keys and history would be gone.
+- The key is on the same server as the database. Encryption protects a copied database file, a backup and a disk snapshot. It does not protect a server someone has already taken over.
+- Processed Edge files in `completed/` and `failed/` are not encrypted. Set `retention_days` to `0` so they are deleted as soon as they are read.
+- A backup made with the steps in [operations](operations.md) must use the same package and key, or copy the encrypted `edt.db` file itself while the services are stopped.

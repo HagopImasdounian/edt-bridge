@@ -35,10 +35,13 @@ The bridge assumes the server is yours, the people who use it are not all equall
 | Redirects refused | Webhook delivery does not follow redirects. | A bearer token being sent to a place you did not name |
 | Plugin file check | A plugin loads only if the bridge's own user owns it and nobody else can write it. | Another user on the machine planting code |
 | Retention | Processed files are deleted after `retention_days`. | Customer files piling up on disk |
+| Encrypted database (optional) | With `db_key_env` set, the database file is AES-256 encrypted with SQLCipher. The key comes from the environment, never the config. The bridge will not start unencrypted. | A copied database file, a backup or a disk snapshot being read |
+| Inbox links refused | A link in the inbox is removed unread. `completed/` and `failed/` are never followed if they are links. | The upload account steering the bridge to read, write or delete elsewhere on the server |
+| Bad files set aside | A file the bridge cannot read goes to `failed/` and nothing from it is kept. | One bad upload stopping every file after it |
 
 The example SFTP and systemd files in [examples/](examples/) add:
 
-- A password account that can do nothing but upload into one folder it cannot list.
+- A password account locked into one folder, with no shell and no forwarding. Add `-P symlink,hardlink` to its `internal-sftp` line so it cannot create links.
 - Key-only SSH for everyone else.
 - Services that run unprivileged, cannot gain privileges and can write only to their own folders.
 
@@ -47,7 +50,8 @@ The example SFTP and systemd files in [examples/](examples/) add:
 The bridge cannot do these for you.
 
 - Keep the operating system and OpenSSH updated.
-- Use disk encryption on the server, or encrypt its volume. The database is not encrypted.
+- Turn on database encryption (`db_key_env`, see [configuration](docs/configuration.md#encrypting-the-database)), or use disk encryption on the server. The database is not encrypted unless you do.
+- Set `retention_days` to `0` if you encrypt the database. Processed Edge files are plain text.
 - Encrypt backups. They hold customer details.
 - Turn on two-step login for your Cloudflare and GitHub accounts.
 - Give each API caller its own key with the fewest scopes. Set `--expires-days`.

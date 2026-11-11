@@ -4,6 +4,16 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Optional database encryption. Set `db_key_env` and the database file is AES-256 encrypted with SQLCipher (`pip install sqlcipher3-binary`, the one optional package). `encrypt` converts an existing database. The bridge refuses to start unencrypted when a key is configured.
+
+### Security
+
+- A file the bridge cannot read (wrong shape, text where a number belongs, nesting too deep) is moved to `failed/` and nothing from it is kept. Before, one such file stopped every file after it on every pass.
+- Links in the inbox are never followed. A linked `*ItemList.json` or `*CustomerList.json` is removed unread, and `completed/` or `failed/` are replaced if they are links. Before, the account that uploads could point `completed/` at another folder and have old `.json` files there deleted.
+- A destination that hangs up while sending an error no longer stops the pass.
+
 ## [0.1.0] - 2026-11-10
 
 First release.

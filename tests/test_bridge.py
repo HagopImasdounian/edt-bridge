@@ -570,6 +570,62 @@ class TestIngest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(env.inbox, "failed", "BrokenItemList.json")))
         self.assertFalse(os.path.exists(os.path.join(env.inbox, "BrokenItemList.json")))
 
+    def test_a_file_the_bridge_cannot_read_does_not_block_the_next_one(self):
+        bad_files = [
+            ("ACustomerList.json", "5"),
+            ("ACustomerList.json", '"just text"'),
+            ("ACustomerList.json", json.dumps({"Customers": "not a list"})),
+            ("ACustomerList.json", json.dumps([{"PairValue": {"CustomerKey": "9", "Emails": 5}}])),
+            ("AItemList.json", json.dumps([{"PairValue": {
+                "ItemKey": "9", "ItemStatus": "S", "ItemSaleKey": "S1", "ItemSalePrice": "abc"}}])),
+            ("AItemList.json", "[" * 100000 + "]" * 100000),
+        ]
+        for n, (name, text) in enumerate(bad_files):
+            with self.subTest(n=n), tempfile.TemporaryDirectory() as root:
+                env = Env(root)
+                with open(os.path.join(env.inbox, name), "w") as f:
+                    f.write(text)
+                env.write("ZItemList.json", {"Items": base_items()})
+                with self.assertLogs("edt-bridge", level="ERROR") as logged:
+                    eb.run_once(env.cfg)
+                self.assertTrue(os.path.exists(os.path.join(env.inbox, "failed", name)))
+                self.assertFalse(os.path.exists(os.path.join(env.inbox, name)))
+                db = env.db()
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 16)
+                # nothing from the bad file is kept, and no value from it reaches the log
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM items WHERE item_key='9'").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM customers").fetchone()[0], 0)
+                db.close()
+                self.assertNotIn("abc", " ".join(logged.output))
+
+    def test_links_in_the_inbox_are_never_followed(self):
+        env = self.env()
+        elsewhere = os.path.join(self._tmp.name, "elsewhere")
+        os.makedirs(elsewhere)
+        old = os.path.join(elsewhere, "config.json")
+        with open(old, "w") as f:
+            f.write("{}")
+        long_ago = time.time() - 40 * 86400
+        os.utime(old, (long_ago, long_ago))
+        outside = os.path.join(self._tmp.name, "outside.json")
+        with open(outside, "w") as f:
+            json.dump({"Items": base_items()}, f)
+        os.symlink(elsewhere, os.path.join(env.inbox, "completed"))
+        os.symlink(elsewhere, os.path.join(env.inbox, "failed"))
+        os.symlink(outside, os.path.join(env.inbox, "LinkedItemList.json"))
+        env.write("RealItemList.json", {"Items": base_items()[:2]})
+        with self.assertLogs("edt-bridge", level="WARNING"):
+            eb.run_once(env.cfg)
+        self.assertTrue(os.path.exists(old), "a file outside the inbox was deleted through a link")
+        self.assertEqual(os.listdir(elsewhere), ["config.json"])
+        self.assertTrue(os.path.exists(outside))
+        self.assertFalse(os.path.lexists(os.path.join(env.inbox, "LinkedItemList.json")))
+        self.assertFalse(os.path.islink(os.path.join(env.inbox, "completed")))
+        self.assertTrue(os.path.exists(os.path.join(env.inbox, "completed", "RealItemList.json")))
+        db = env.db()
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 2)
+        db.close()
+
     def test_file_still_uploading_is_left_alone(self):
         env = self.env(settle_seconds=3600)
         env.ingest()
@@ -1707,6 +1763,113 @@ class TestRebindingAndPlugins(unittest.TestCase):
         status, _ = eb.http_post(f"http://127.0.0.1:{srv.server_address[1]}/", "{}", {"Authorization": "Bearer t"})
         srv.server_close()
         self.assertEqual(status, 302)
+
+
+try:
+    from sqlcipher3 import dbapi2 as _sqlcipher
+except ImportError:
+    _sqlcipher = None
+DB_KEY = "ab" * 32
+
+
+class TestEncryptedDatabase(unittest.TestCase):
+    """db_key_env turns on SQLCipher. The checks that need the package are skipped without it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patch = mock.patch.dict(os.environ, {"EDT_TEST_DB_KEY": DB_KEY})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(reset_caches)
+        reset_caches()
+
+    def test_off_by_default(self):
+        env = Env(self._tmp.name)
+        self.assertIsNone(eb.db_key(env.cfg))
+        self.assertIs(eb.db_module(env.cfg), sqlite3)
+
+    def test_a_missing_or_bad_key_stops_the_bridge(self):
+        for value in (None, "", "short", "zz" * 32, DB_KEY + "00"):
+            env = Env(self._tmp.name, db_key_env="EDT_TEST_DB_KEY")
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                os.environ.pop("EDT_TEST_DB_KEY", None)
+                if value is not None:
+                    os.environ["EDT_TEST_DB_KEY"] = value
+                with self.assertRaises(eb.DbKeyError):
+                    eb.open_db(env.cfg)
+                self.assertFalse(os.path.exists(os.path.join(env.data, "edt.db")),
+                                 "fell back to an unencrypted database")
+
+    def test_a_missing_package_stops_the_bridge(self):
+        env = Env(self._tmp.name, db_key_env="EDT_TEST_DB_KEY")
+        with mock.patch.dict("sys.modules", {"sqlcipher3": None}):
+            with self.assertRaises(eb.DbKeyError):
+                eb.open_db(env.cfg)
+        self.assertFalse(os.path.exists(os.path.join(env.data, "edt.db")))
+
+    def test_the_key_cannot_be_set_from_the_settings_page(self):
+        changes, errors = eb.settings_clean({"db_key_env": "PATH"})
+        self.assertIn("_", errors)
+        self.assertNotIn("db_key_env", changes)
+
+    @unittest.skipUnless(_sqlcipher, "sqlcipher3 is not installed")
+    def test_file_is_unreadable_without_the_key_and_everything_still_works(self):
+        env = Env(self._tmp.name, db_key_env="EDT_TEST_DB_KEY")
+        self.assertTrue(env.ingest())
+        path = os.path.join(env.data, "edt.db")
+        with open(path, "rb") as f:
+            raw = f.read()
+        self.assertFalse(raw.startswith(b"SQLite format 3"))
+        for word in (b"Customer", b"ItemKey", b"CREATE TABLE"):
+            self.assertNotIn(word, raw)
+        with self.assertRaises(sqlite3.DatabaseError):
+            sqlite3.connect(path).execute("SELECT COUNT(*) FROM items")
+        with mock.patch.dict(os.environ, {"EDT_TEST_DB_KEY": "cd" * 32}):
+            with self.assertRaises(eb.DbKeyError):
+                eb.connect_db(env.cfg)
+        db = eb.connect_db(env.cfg, readonly=True)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 16)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM skus").fetchone()[0] > 0, True)
+        with self.assertRaises(_sqlcipher.OperationalError):
+            db.execute("DELETE FROM items")
+        status, body = eb.api_query(db, env.cfg, {"inventory", "sales", "customers"}, ["customers"], "", 500)
+        self.assertEqual((status, len(body["data"])), (200, 6))
+        self.assertTrue(eb.ui_query(db, env.cfg, "summary", {})["customers"] == 6)
+        db.close()
+        # a dry run reads the encrypted database and changes nothing
+        env.write("MoreItemList.json", {"Items": base_items()[:1]})
+        before = os.path.getmtime(path)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(eb.run_once(env.cfg, dry_run=True))
+        self.assertEqual(os.path.getmtime(path), before)
+
+    @unittest.skipUnless(_sqlcipher, "sqlcipher3 is not installed")
+    def test_encrypt_converts_an_existing_database_in_place(self):
+        env = Env(self._tmp.name)
+        env.ingest()
+        key = env.make_key("website", "inventory")
+        path = os.path.join(env.data, "edt.db")
+        with open(path, "rb") as f:
+            self.assertTrue(f.read(16).startswith(b"SQLite format 3"))
+        env = Env(self._tmp.name, db_key_env="EDT_TEST_DB_KEY")
+        with self.assertRaises(eb.DbKeyError):  # a plain database is refused, not read
+            eb.connect_db(env.cfg)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            eb.cmd_encrypt(env.cfg)
+            eb.cmd_encrypt(env.cfg)  # running it twice is harmless
+        self.assertIn("Already encrypted", out.getvalue())
+        with open(path, "rb") as f:
+            self.assertFalse(f.read(16).startswith(b"SQLite format 3"))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0)
+        db = eb.open_db(env.cfg)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 16)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM customer_list").fetchone()[0], 6)
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], eb.VIEWS_VERSION)
+        row = db.execute("SELECT hash FROM api_keys").fetchone()
+        self.assertEqual(row["hash"], eb.key_hash(key))
+        db.close()
 
 
 if __name__ == "__main__":

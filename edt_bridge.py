@@ -122,6 +122,16 @@ EDT_BRIDGE_CONFIG. The .gitignore refuses them if they land here anyway.
 Privacy: these files hold customer names, emails and phone numbers. Processed
 files are kept for `retention_days` and then deleted. Set it to 0 to delete
 them as soon as they are processed.
+
+Encrypting the database (optional): set "db_key_env": "EDT_DB_KEY" in the config and
+put 64 hex characters in that environment variable. The whole database file is then
+AES-256 encrypted with SQLCipher, which is the one optional package
+(pip install sqlcipher3-binary). `edt_bridge.py encrypt` converts a database that
+already exists. With the key set, the bridge refuses to start rather than fall back
+to an unencrypted database. Lose the key and the data cannot be read. The key lives
+on the same server, so this protects a copied file, a backup or a disk snapshot,
+not a server someone has already taken over. Set retention_days to 0 as well, or
+the processed Edge files keep the same details in plain text.
 """
 
 import argparse
@@ -165,6 +175,7 @@ EXAMPLE_CONFIG = {
     "exclude_item_prefixes": [],
     "sku_fields": ["ItemMetaBaseSKU", "ItemVendStyleCode", "ItemStyle"],
     "heartbeat_url": "",
+    "db_key_env": "",
     "phone_country_code": "1",
     "gold_rules": [],
     "ui": {"host": "127.0.0.1", "port": 8787, "password_env": "EDT_UI_PASSWORD",
@@ -290,26 +301,95 @@ CREATE VIEW customer_list AS SELECT
 """
 
 
+class DbKeyError(Exception):
+    """The database is set to be encrypted and cannot be opened as configured."""
+
+
+def db_key(cfg):
+    """The database key when encryption is on, else None.
+
+    Encryption is on when db_key_env names an environment variable. That variable holds
+    64 hex characters (make one: python3 -c "import secrets; print(secrets.token_hex(32))").
+    The key is never read from the config file, so it never sits next to the database.
+    """
+    env = str(cfg.get("db_key_env") or "").strip()
+    if not env:
+        return None
+    key = os.environ.get(env, "").strip()
+    if not re.match(r"^[0-9a-fA-F]{64}$", key):
+        raise DbKeyError(f"db_key_env is set, so the database is encrypted, but ${env} does not hold "
+                         "a key (64 hex characters). The bridge will not fall back to an unencrypted "
+                         "database.")
+    return key.lower()
+
+
+def db_module(cfg):
+    """sqlite3, or SQLCipher's drop-in copy of it when the database is encrypted."""
+    if not db_key(cfg):
+        return sqlite3
+    try:
+        from sqlcipher3 import dbapi2
+    except ImportError:
+        raise DbKeyError("db_key_env is set, so the database is encrypted with SQLCipher (AES-256). "
+                         "That is the one optional package: pip install sqlcipher3-binary")
+    return dbapi2
+
+
+def db_path(cfg):
+    return os.path.join(cfg["data_dir"], "edt.db")
+
+
+def connect_db(cfg, path=None, readonly=False, timeout=5.0):
+    """Open the database file, with the key when it is encrypted. Row access by name."""
+    mod, key = db_module(cfg), db_key(cfg)
+    path = path or db_path(cfg)
+    if readonly:
+        db = mod.connect("file:" + quote(path) + "?mode=ro", uri=True, timeout=timeout)
+    else:
+        db = mod.connect(path, timeout=timeout)
+    if key:
+        db.execute(f"PRAGMA key = \"x'{key}'\"")
+        try:
+            db.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        except mod.DatabaseError:
+            db.close()
+            raise DbKeyError(f"{path} could not be opened with the key. Either the key is wrong, or "
+                             "the database was made before encryption was turned on (run: "
+                             "edt_bridge.py encrypt).")
+    db.row_factory = mod.Row
+    return db
+
+
 def open_db(cfg, dry_run=False):
-    if dry_run:
+    if dry_run and not db_key(cfg):
         db = sqlite3.connect(":memory:")
-        src_path = os.path.join(cfg["data_dir"], "edt.db")
-        if os.path.exists(src_path):  # start from the real state, change nothing
-            src = sqlite3.connect(src_path)
+        if os.path.exists(db_path(cfg)):  # start from the real state, change nothing
+            src = sqlite3.connect(db_path(cfg))
             src.backup(db)
             src.close()
+        db.row_factory = sqlite3.Row
+    elif dry_run:
+        # Encrypted: work on a throwaway copy that is encrypted with the same key.
+        import atexit
+        import tempfile
+        folder = tempfile.mkdtemp(prefix="edt-dry-")
+        atexit.register(shutil.rmtree, folder, True)
+        copy = os.path.join(folder, "edt.db")
+        if os.path.exists(db_path(cfg)):
+            src = connect_db(cfg)
+            src.execute("VACUUM INTO ?", (copy,))
+            src.close()
+        db = connect_db(cfg, copy)
     else:
         os.makedirs(cfg["data_dir"], exist_ok=True)
-        db_path = os.path.join(cfg["data_dir"], "edt.db")
-        fresh = not os.path.exists(db_path)
-        db = sqlite3.connect(db_path)
+        fresh = not os.path.exists(db_path(cfg))
+        db = connect_db(cfg)
         if fresh:  # customer details live here: keep other users on the machine out
             try:
                 os.chmod(cfg["data_dir"], 0o700)
-                os.chmod(db_path, 0o600)
+                os.chmod(db_path(cfg), 0o600)
             except OSError:
                 pass
-    db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
     if db.execute("PRAGMA user_version").fetchone()[0] != VIEWS_VERSION:
         for name in ("customer_list", "sale_lines", "unreferenced", "skus", "pieces"):
@@ -669,8 +749,19 @@ def process_inbox(db, cfg, dry_run=False):
     # Customers first, so a sale in the same batch can pick up its customer.
     jobs = [("customer", p) for p in sorted(glob.glob(os.path.join(inbox, "*CustomerList.json")))]
     jobs += [("item", p) for p in sorted(glob.glob(os.path.join(inbox, "*ItemList.json")))]
+    # Whoever uploads owns the inbox. A link planted there must never steer the bridge
+    # into reading, writing or deleting somewhere else on the server.
+    for folder in (done_dir, failed_dir):
+        if os.path.islink(folder) and not dry_run:
+            log.warning("%s was a link, removed it", os.path.basename(folder))
+            os.remove(folder)
     for kind, path in jobs:
         name = os.path.basename(path)
+        if os.path.islink(path) or not os.path.isfile(path):
+            log.warning("%s is a link or not a plain file, removed it unread", name)
+            if not dry_run and os.path.islink(path):
+                os.remove(path)
+            continue
         if time.time() - os.path.getmtime(path) < cfg["settle_seconds"]:
             log.info("%s is still uploading, will pick it up next pass", name)
             continue
@@ -686,16 +777,34 @@ def process_inbox(db, cfg, dry_run=False):
             doc = json.loads(raw.decode("utf-8-sig"))
             if isinstance(doc, list):
                 records = doc
-            else:
+            elif isinstance(doc, dict):
                 top = "Customers" if kind == "customer" else "Items"
                 records = doc.get(top) or doc.get(top.lower()) or []
-        except (ValueError, UnicodeDecodeError) as e:
-            log.error("%s is not readable JSON (%s), moved to failed/", name, e)
+            else:
+                raise ValueError("expected a list of records")
+            if not isinstance(records, list):
+                raise ValueError("expected a list of records")
+        except (ValueError, UnicodeDecodeError, RecursionError) as e:
+            log.error("%s is not readable JSON (%s), moved to failed/", name,
+                      e if isinstance(e, ValueError) else type(e).__name__)
             if not dry_run:
                 put_away(path, failed_dir, file_hash)
             continue
         handler = process_customers if kind == "customer" else process_items
-        changed = handler(db, cfg, records)
+        try:
+            changed = handler(db, cfg, records)
+        except (MemoryError, OSError, sqlite3.Error, db_module(cfg).Error):
+            raise  # the server's trouble, not the file's: leave it for the next pass
+        except Exception as e:
+            # One file with a record the bridge cannot read must not block every file
+            # after it. Nothing from it is kept. The message can quote a value, so only
+            # the kind of error is logged.
+            db.rollback()
+            log.error("%s holds a record that cannot be read (%s), moved to failed/",
+                      name, type(e).__name__)
+            if not dry_run:
+                put_away(path, failed_dir, file_hash)
+            continue
         db.execute("INSERT INTO files (hash, name, kind, records, processed_at) VALUES (?,?,?,?,?)",
                    (file_hash, name, kind, len(records), now_iso()))
         db.commit()  # the file's changes and its events land together
@@ -741,7 +850,10 @@ def http_post(url, body, headers):
         with _opener.open(req, timeout=60) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")[:500]
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")[:500]
+        try:
+            return e.code, e.read().decode("utf-8", "replace")[:500]
+        except OSError:  # the other end hung up before sending the rest
+            return e.code, ""
     except (urllib.error.URLError, OSError) as e:
         return 0, str(e)
 
@@ -1580,7 +1692,7 @@ def settings_clean(body):
             changes["gold_rules"] = rules
     unknown = set(body) - set(EXAMPLE_CONFIG) - {"default_layer", "requests_per_minute", "max_limit"}
     locked = set(body) & {"inbox", "data_dir", "destinations", "ui", "api", "heartbeat_url",
-                          "settle_seconds", "poll_seconds"}
+                          "settle_seconds", "poll_seconds", "db_key_env"}
     if unknown or locked:
         errors["_"] = "That setting cannot be changed from this page."
     return changes, errors
@@ -1623,7 +1735,6 @@ def cmd_serve(cfg, config_path=None):
     verifier = make_verifier(ui.get("cloudflare_access"), "ui")
     bad = Window(10, 300)  # wrong passwords per caller, then locked out
     open_db(cfg).close()  # make sure the database and its views exist
-    db_uri = "file:" + quote(os.path.join(cfg["data_dir"], "edt.db")) + "?mode=ro"
     live = {"cfg": cfg}  # replaced when the settings page saves
 
     class Handler(BaseHTTPRequestHandler):
@@ -1727,8 +1838,7 @@ def cmd_serve(cfg, config_path=None):
                 return self.reply(200, PAGE, "text/html; charset=utf-8")
             if not url.path.startswith("/api/"):
                 return self.reply(404, "Not found", "text/plain; charset=utf-8")
-            db = sqlite3.connect(db_uri, uri=True)
-            db.row_factory = sqlite3.Row
+            db = connect_db(cfg, readonly=True)
             try:
                 if url.path == "/api/settings":
                     result = settings_view(cfg, db)
@@ -2695,8 +2805,7 @@ def cmd_api(cfg, local=False, config_path=None):
                  "To test on this machine only: edt_bridge.py api --local")
 
     open_db(cfg).close()  # make sure the database, views and key table exist
-    db_uri = "file:" + quote(os.path.join(cfg["data_dir"], "edt.db")) + "?mode=ro"
-    if not sqlite3.connect(db_uri, uri=True).execute(
+    if not connect_db(cfg, readonly=True).execute(
             "SELECT COUNT(*) FROM api_keys WHERE revoked_at IS NULL").fetchone()[0]:
         log.warning("No API keys yet, so every request will be refused. Make one with: apikey create")
 
@@ -2764,8 +2873,7 @@ def cmd_api(cfg, local=False, config_path=None):
                 return 429, {"error": "too many bad keys, try later"}, wait
             scheme, _, given = self.headers.get("Authorization", "").partition(" ")
             m = API_KEY_RE.match(given.strip()) if scheme.lower() == "bearer" else None
-            db = sqlite3.connect(db_uri, uri=True, timeout=5)
-            db.row_factory = sqlite3.Row
+            db = connect_db(cfg, readonly=True)
             try:
                 db.execute("PRAGMA query_only = ON")
                 row = db.execute("SELECT * FROM api_keys WHERE id = ?", (m.group(1),)).fetchone() if m else None
@@ -2866,6 +2974,53 @@ def cmd_fields(cfg):
           "number, not a SKU.")
 
 
+def cmd_encrypt(cfg):
+    """Turn an existing plain database into an encrypted one, in place."""
+    if not db_key(cfg):
+        sys.exit("Set db_key_env in the config and put the key in that environment variable first.")
+    mod, path = db_module(cfg), db_path(cfg)
+    if not os.path.exists(path):
+        sys.exit("No database yet. It will be created encrypted on the first run.")
+    lock = single_instance(cfg)  # the watcher must not be writing while this runs
+    try:
+        connect_db(cfg).close()
+        print("Already encrypted with this key. Nothing to do.")
+        return
+    except DbKeyError:
+        pass
+    plain = mod.connect(path)
+    try:
+        version = plain.execute("PRAGMA user_version").fetchone()[0]
+        plain.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except mod.DatabaseError:
+        sys.exit(f"{path} is neither a plain database nor one this key opens. Nothing was changed.")
+    tmp = f"{path}.{os.getpid()}.enc"
+    old_mask = os.umask(0o077)  # the new file is for this user only from the first byte
+    try:
+        plain.execute(f"ATTACH DATABASE ? AS enc KEY \"x'{db_key(cfg)}'\"", (tmp,))
+        plain.execute("SELECT sqlcipher_export('enc')")
+        plain.execute(f"PRAGMA enc.user_version = {int(version)}")
+        plain.execute("DETACH DATABASE enc")
+    finally:
+        os.umask(old_mask)
+        plain.close()
+    check = connect_db(cfg, tmp)
+    want = mod.connect(path)
+    for table in ("items", "customers", "sales", "outbox", "api_keys", "files", "changes"):
+        sql = f"SELECT COUNT(*) FROM {table}"
+        if check.execute(sql).fetchone()[0] != want.execute(sql).fetchone()[0]:
+            os.remove(tmp)
+            sys.exit(f"The encrypted copy did not match on {table}. Nothing was changed.")
+    check.close()
+    want.close()
+    os.replace(tmp, path)
+    for extra in (path + "-wal", path + "-shm"):
+        if os.path.exists(extra):
+            os.remove(extra)
+    print(f"{path} is now encrypted. Keep the key somewhere safe: without it the data cannot be read.\n"
+          "Restart the services. Old unencrypted backups and copies still hold the data: delete them.")
+
+
 def cmd_show(cfg, query):
     """Look something up by SKU, item key or serial number."""
     db = open_db(cfg)
@@ -2900,7 +3055,7 @@ def cmd_show(cfg, query):
 def main():
     p = argparse.ArgumentParser(description="Pass Edge Data Transfer files on to your own systems.")
     p.add_argument("command", choices=["init", "run", "watch", "status", "retry", "fields", "show", "serve",
-                                      "api", "apikey"])
+                                      "api", "apikey", "encrypt"])
     p.add_argument("query", nargs="?", help="for show: a SKU, item key or serial number. "
                                             "for apikey: create, list or revoke")
     p.add_argument("arg", nargs="?", help="for apikey revoke: the key id")
@@ -2928,7 +3083,17 @@ def main():
         return
 
     cfg = load_config(args.config)
-    if args.command == "status":
+    try:
+        # Fail at the start, with the reason, when encryption is on but the key, the
+        # package or the database does not match. Never carry on unencrypted.
+        db_module(cfg)
+        if db_key(cfg) and args.command != "encrypt" and os.path.exists(db_path(cfg)):
+            connect_db(cfg, readonly=True).close()
+    except DbKeyError as e:
+        sys.exit(str(e))
+    if args.command == "encrypt":
+        cmd_encrypt(cfg)
+    elif args.command == "status":
         cmd_status(cfg)
     elif args.command == "serve":
         cmd_serve(cfg, args.config)
